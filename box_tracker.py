@@ -4,7 +4,7 @@ from collections import deque
 
 
 class BoxTracker:
-    """Modern box tracking system for clean, futuristic object detection visualization."""
+    """box tracking system for simple object detection visualization."""
     
     def __init__(self, settings=None):
         self.trail_length = 30
@@ -15,17 +15,60 @@ class BoxTracker:
         self.settings = settings or {}
         self.show_trails = self.settings.get('showTrails', True)
         self.color_mode = self.settings.get('colorMode', 'auto')
-        self.shader_effects = self.settings.get('shaderEffects', True)
+        self.remove_jitter = self.settings.get('removeJitter', False)
+        self.object_size = self.settings.get('objectSize', 'medium')
         self.show_coordinates = self.settings.get('showCoordinates', True)
+        self.effect_area = self._parse_effect_area()
+        self.canvas_format = self.settings.get('canvasFormat', 'mobile')
         
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=50, detectShadows=False
         )
         
-        self.min_area = 200
+        self._set_size_parameters()
         self.max_tracking_distance = 100
         self.stationary_threshold = 3.0
         self.max_missing_frames = 20
+        
+    def _set_size_parameters(self):
+        """Set minimum area based on object size preference."""
+        size_settings = {
+            'small': 50,      # For faces, hands, small objects
+            'medium': 200,    # For people, cars, medium objects  
+            'large': 800,     # For vehicles, large objects, groups
+            'all': 25         # Track everything above noise level
+        }
+        self.min_area = size_settings.get(self.object_size, 200)
+        
+    def _is_jittery_track(self, track):
+        """Detect if a track is jittery (erratic movement)."""
+        if not self.remove_jitter or len(track['centers']) < 5:
+            return False
+            
+        recent_centers = list(track['centers'])[-5:]
+        if len(recent_centers) < 3:
+            return False
+            
+        distances = []
+        for i in range(1, len(recent_centers)):
+            x1, y1 = recent_centers[i-1]
+            x2, y2 = recent_centers[i]
+            dist = ((x2-x1)**2 + (y2-y1)**2)**0.5
+            distances.append(dist)
+            
+        if not distances:
+            return False
+            
+        avg_distance = sum(distances) / len(distances)
+        if avg_distance < 2.0:
+            return True
+            
+        if len(distances) > 2:
+            variance = sum((d - avg_distance)**2 for d in distances) / len(distances)
+            if variance > avg_distance * 2:
+                return True
+                
+        return False
         
     def detect_moving_objects(self, frame):
         """Detect moving objects and return their bounding boxes."""
@@ -37,6 +80,8 @@ class BoxTracker:
         
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        scaled_area = self._get_scaled_effect_area(frame)
+        
         detections = []
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -44,6 +89,9 @@ class BoxTracker:
                 continue
                 
             x, y, w, h = cv2.boundingRect(contour)
+            
+            if not self._is_detection_in_area((x, y, w, h), scaled_area):
+                continue
             
             cx = x + w // 2
             cy = y + h // 2
@@ -68,10 +116,10 @@ class BoxTracker:
             for track_id, track in self.tracks.items():
                 if track_id in matched_tracks:
                     continue
-                    
+                
                 if track['missing_frames'] > 0:
                     continue
-                    
+                
                 last_center = track['centers'][-1]
                 distance = np.sqrt((center[0] - last_center[0])**2 + (center[1] - last_center[1])**2)
                 
@@ -97,7 +145,6 @@ class BoxTracker:
                     p2 = track['centers'][-1]
                     velocity = np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
                     track['velocity'] = velocity
-                
             else:
                 track_id = f"T{self.next_id:03d}"
                 self.next_id += 1
@@ -110,12 +157,13 @@ class BoxTracker:
                     'velocity': 0.0,
                     'color': self._generate_color(track_id)
                 }
-        
+    
         for track_id, track in list(self.tracks.items()):
             if track_id not in matched_tracks:
                 track['missing_frames'] += 1
                 
-                if track['missing_frames'] > self.max_missing_frames:
+                if (track['missing_frames'] > self.max_missing_frames or 
+                    self._is_jittery_track(track)):
                     del self.tracks[track_id]
     
     def _generate_color(self, track_id):
@@ -195,12 +243,10 @@ class BoxTracker:
         """Draw tracking visualization on frame."""
         result = frame.copy()
         
-        shader_layer = np.zeros_like(frame) if self.shader_effects else None
-        
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.35
         text_thickness = 1
-        line_thickness = 2 if self.shader_effects else 1
+        line_thickness = 1
         
         for track_id, track in self.tracks.items():
             if track['missing_frames'] > 0:
@@ -218,19 +264,6 @@ class BoxTracker:
                 x, y, w, h = bboxes[-1]
                 box_color = self._get_negative_color(result, x + w//2, y + h//2, w, h)
                 
-                if self.shader_effects:
-                    cv2.rectangle(shader_layer, (x-2, y-2), (x + w + 2, y + h + 2), box_color, 3, cv2.LINE_AA)
-                    corner_size = min(w, h) // 6
-                    corner_thickness = 3
-                    cv2.line(shader_layer, (x, y), (x + corner_size, y), box_color, corner_thickness, cv2.LINE_AA)
-                    cv2.line(shader_layer, (x, y), (x, y + corner_size), box_color, corner_thickness, cv2.LINE_AA)
-                    cv2.line(shader_layer, (x + w, y), (x + w - corner_size, y), box_color, corner_thickness, cv2.LINE_AA)
-                    cv2.line(shader_layer, (x + w, y), (x + w, y + corner_size), box_color, corner_thickness, cv2.LINE_AA)
-                    cv2.line(shader_layer, (x, y + h), (x + corner_size, y + h), box_color, corner_thickness, cv2.LINE_AA)
-                    cv2.line(shader_layer, (x, y + h), (x, y + h - corner_size), box_color, corner_thickness, cv2.LINE_AA)
-                    cv2.line(shader_layer, (x + w, y + h), (x + w - corner_size, y + h), box_color, corner_thickness, cv2.LINE_AA)
-                    cv2.line(shader_layer, (x + w, y + h), (x + w, y + h - corner_size), box_color, corner_thickness, cv2.LINE_AA)
-                
                 cv2.rectangle(result, (x, y), (x + w, y + h), box_color, line_thickness, cv2.LINE_AA)
             
             if self.show_trails and len(centers) > 1:
@@ -244,11 +277,7 @@ class BoxTracker:
                     cv2.line(result, centers[i-1], centers[i], faded_color, line_thickness, cv2.LINE_AA)
             
             crosshair_color = self._get_negative_color(result, current_center[0], current_center[1])
-            crosshair_size = 8 if self.shader_effects else 6
-            
-            if self.shader_effects:
-                cv2.drawMarker(shader_layer, current_center, crosshair_color, cv2.MARKER_CROSS, crosshair_size + 2, 3, cv2.LINE_AA)
-            
+            crosshair_size = 2
             cv2.drawMarker(result, current_center, crosshair_color, cv2.MARKER_CROSS, crosshair_size, line_thickness, cv2.LINE_AA)
             
             if self.show_coordinates:
@@ -273,14 +302,51 @@ class BoxTracker:
                 cv2.putText(result, id_text, (text_x, text_y + 15), 
                            font, font_scale * 0.7, id_color, text_thickness, cv2.LINE_AA)
         
-        if self.shader_effects and shader_layer is not None:
-            glow_layer = cv2.GaussianBlur(shader_layer, (15, 15), 0)
-            
-            result = cv2.addWeighted(result, 1.0, glow_layer, 0.4, 0)
-            
-            result = cv2.add(result, shader_layer)
-        
         return result
+    
+    def _parse_effect_area(self):
+        """Parse and validate the effect area from settings."""
+        effect_area = self.settings.get('postProductionArea', None)
+        if not effect_area or not isinstance(effect_area, dict):
+            return None
+        
+        x = effect_area.get('x', 0)
+        y = effect_area.get('y', 0)
+        width = effect_area.get('width', 0)
+        height = effect_area.get('height', 0)
+        
+        if width <= 0 or height <= 0:
+            return None
+        
+        return (float(x), float(y), float(width), float(height))
+    
+    def _is_detection_in_area(self, bbox, area):
+        """Check if a detection is within the specified area."""
+        if not area:
+            return True
+        
+        x, y, w, h = bbox
+        center_x = x + w // 2
+        center_y = y + h // 2
+        
+        px, py, pw, ph = area
+        return (center_x >= px and center_y >= py and 
+                center_x <= px + pw and center_y <= py + ph)
+    
+    def _get_scaled_effect_area(self, frame):
+        """Scale the effect area to match the video dimensions."""
+        if not self.effect_area:
+            return None
+        
+        video_height, video_width = frame.shape[:2]
+        px, py, pw, ph = self.effect_area
+        
+        scaled_x = int(px * video_width)
+        scaled_y = int(py * video_height)
+        scaled_w = int(pw * video_width)
+        scaled_h = int(ph * video_height)
+        
+        return (scaled_x, scaled_y, scaled_w, scaled_h)
     
     def process_frame(self, frame, frame_idx):
         """Process a single frame and return visualization."""
